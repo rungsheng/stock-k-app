@@ -4,7 +4,7 @@ import pandas as pd
 import io
 
 # --- 設定網頁 ---
-st.set_page_config(page_title="施昇輝 K值儀表板 (個人版)", page_icon="📈")
+st.set_page_config(page_title="K值儀表板 (個人版)", page_icon="📈")
 
 # --- 預設清單 ---
 DEFAULT_STOCKS = {
