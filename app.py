@@ -1,16 +1,12 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import json
-import os
+import io
 
 # --- 設定網頁 ---
-st.set_page_config(page_title="施昇輝 K值儀表板 (自選股版)", page_icon="📈")
+st.set_page_config(page_title="施昇輝 K值儀表板 (個人版)", page_icon="📈")
 
-# --- 檔案儲存設定 (讓清單可以永久保存) ---
-DATA_FILE = "my_stocks.json"
-
-# 預設清單 (如果第一次執行，會用這個建立檔案)
+# --- 預設清單 ---
 DEFAULT_STOCKS = {
     "0050.TW": "元大台灣50",
     "0056.TW": "元大高股息",
@@ -19,84 +15,119 @@ DEFAULT_STOCKS = {
     "2002.TW": "中鋼"
 }
 
-# --- 讀取與寫入資料的函數 ---
-def load_stock_list():
-    """從 JSON 檔案讀取股票清單，如果沒有檔案就用預設值"""
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return DEFAULT_STOCKS
-    return DEFAULT_STOCKS
-
-def save_stock_list(data):
-    """將股票清單寫入 JSON 檔案"""
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-# --- 初始化 Session State ---
-if 'stock_dict' not in st.session_state:
-    st.session_state.stock_dict = load_stock_list()
-
-# --- 側邊欄：新增與刪除功能 ---
-st.sidebar.title("⚙️ 管理自選股")
-
-# 1. 新增股票區塊
-with st.sidebar.expander("➕ 新增股票", expanded=True):
-    new_ticker = st.text_input("股票代號", placeholder="例如: 2330 或 00878")
-    new_name = st.text_input("股票名稱 (選填)", placeholder="例如: 台積電")
-    
-    if st.button("加入清單"):
-        if new_ticker:
-            # 自動修正代號：如果是4-5位數字且沒打.TW，自動幫加上
-            ticker_formatted = new_ticker.strip().upper()
-            if ticker_formatted.isdigit() and len(ticker_formatted) >= 4:
-                ticker_formatted += ".TW"
-            
-            # 如果沒填名稱，就用代號當名稱
-            name_to_save = new_name if new_name else ticker_formatted
-            
-            # 更新狀態並存檔
-            st.session_state.stock_dict[ticker_formatted] = name_to_save
-            save_stock_list(st.session_state.stock_dict)
-            st.success(f"已新增: {name_to_save}")
-            st.rerun() # 重新整理頁面
+# --- 核心邏輯：資料載入與同步 ---
+def init_session_state():
+    """
+    優先順序：
+    1. 網址參數 (URL Query Params) - 為了讓加入書籤能運作
+    2. 預設清單
+    """
+    if 'stock_dict' not in st.session_state:
+        # 嘗試從網址讀取 ?tickers=0050.TW,2330.TW...
+        query_params = st.query_params
+        url_tickers = query_params.get("tickers", None)
+        
+        if url_tickers:
+            # 如果網址有參數，解析它 (網址只存代號，名稱需重新抓或暫時用代號)
+            tickers_list = url_tickers.split(",")
+            st.session_state.stock_dict = {t: t for t in tickers_list} # 暫時用代號當名稱
+            # 這裡可以做優化：如果代號在預設清單中，就用預設名稱
+            for t in st.session_state.stock_dict:
+                if t in DEFAULT_STOCKS:
+                    st.session_state.stock_dict[t] = DEFAULT_STOCKS[t]
         else:
-            st.warning("請輸入股票代號")
+            # 使用預設值
+            st.session_state.stock_dict = DEFAULT_STOCKS.copy()
 
-# 2. 刪除股票區塊
-with st.sidebar.expander("🗑️ 刪除股票"):
-    # 製作選單選項
-    options = list(st.session_state.stock_dict.keys())
-    # 顯示格式：名稱 (代號)
-    format_func = lambda x: f"{st.session_state.stock_dict[x]} ({x})"
-    
-    delete_list = st.multiselect("選擇要移除的股票", options, format_func=format_func)
-    
-    if st.button("確認刪除"):
-        if delete_list:
-            for item in delete_list:
-                del st.session_state.stock_dict[item]
-            save_stock_list(st.session_state.stock_dict)
-            st.success("刪除成功！")
-            st.rerun()
+def update_url():
+    """將目前的清單寫入網址參數，讓使用者可以存成書籤"""
+    tickers = ",".join(st.session_state.stock_dict.keys())
+    st.query_params["tickers"] = tickers
+
+# 初始化
+init_session_state()
+
+# --- 側邊欄：CSV 管理與編輯 ---
+st.sidebar.title("📂 清單管理")
+
+# 1. CSV 下載 (匯出)
+# 將 dict 轉為 DataFrame 再轉 CSV
+export_df = pd.DataFrame(list(st.session_state.stock_dict.items()), columns=["代號", "名稱"])
+csv_buffer = export_df.to_csv(index=False).encode('utf-8-sig') # 加上 sig 讓 Excel 打開不會亂碼
+
+st.sidebar.download_button(
+    label="⬇️ 下載目前清單 (CSV)",
+    data=csv_buffer,
+    file_name="my_k_stocks.csv",
+    mime="text/csv"
+)
+
+# 2. CSV 上傳 (匯入)
+uploaded_file = st.sidebar.file_uploader("⬆️ 上傳清單 (CSV)", type=["csv"])
+
+if uploaded_file is not None:
+    try:
+        # 讀取 CSV
+        df_import = pd.read_csv(uploaded_file)
+        # 檢查欄位
+        if "代號" in df_import.columns:
+            new_dict = {}
+            for index, row in df_import.iterrows():
+                code = str(row["代號"]).strip().upper()
+                name = str(row["名稱"]).strip() if "名稱" in df_import.columns else code
+                # 確保代號格式
+                if code.isdigit() and len(code) >= 4:
+                    code += ".TW"
+                new_dict[code] = name
+            
+            # 更新 Session
+            st.session_state.stock_dict = new_dict
+            update_url() # 同步更新網址
+            st.sidebar.success(f"成功匯入 {len(new_dict)} 檔股票！")
+            uploaded_file = None # 重置
+        else:
+            st.sidebar.error("CSV 格式錯誤：必須包含「代號」欄位")
+    except Exception as e:
+        st.sidebar.error(f"讀取失敗: {e}")
 
 st.sidebar.markdown("---")
-st.sidebar.caption(f"目前監控中: {len(st.session_state.stock_dict)} 檔")
 
-# --- 主畫面：儀表板 ---
+# 3. 手動新增/刪除 (維持之前的設計)
+with st.sidebar.expander("➕ / 🗑️ 手動編輯", expanded=False):
+    # 新增
+    col1, col2 = st.columns([2, 3])
+    new_ticker = st.text_input("代號", placeholder="2330")
+    new_name = st.text_input("名稱", placeholder="台積電")
+    
+    if st.button("加入"):
+        if new_ticker:
+            code = new_ticker.strip().upper()
+            if code.isdigit() and len(code) >= 4: code += ".TW"
+            name = new_name if new_name else code
+            st.session_state.stock_dict[code] = name
+            update_url() # 更新網址
+            st.rerun()
+
+    # 刪除
+    del_options = list(st.session_state.stock_dict.keys())
+    del_list = st.multiselect("移除股票", del_options, format_func=lambda x: f"{st.session_state.stock_dict[x]}")
+    if st.button("確認移除"):
+        for item in del_list:
+            del st.session_state.stock_dict[item]
+        update_url() # 更新網址
+        st.rerun()
+
+# --- 主畫面 ---
 st.title("📈 樂活投資 K值偵測")
-st.caption("策略：K<20 買進 (綠色) | K>80 賣出 (紅色)")
+st.caption("K<20 買進 (綠) | K>80 賣出 (紅) | 網址即為您的專屬設定，請加入書籤保存。")
 
-# 重新整理按鈕
-if st.button('🔄 更新最新股價'):
+if st.button('🔄 更新股價'):
     st.cache_data.clear()
     st.rerun()
 
 st.write("---")
 
-# --- 核心計算邏輯 (保持不變) ---
+# --- 核心計算 (KD) ---
 def get_k_value(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -113,64 +144,45 @@ def get_k_value(ticker):
         k = 50
         for rsv in df['RSV']:
             k = (2/3) * k + (1/3) * rsv
-            
         return current_price, k
     except:
         return None, 0
 
-# --- 迴圈顯示每一張卡片 ---
-# 為了美觀，如果沒有股票要提示
+# --- 顯示列表 ---
 if not st.session_state.stock_dict:
-    st.info("目前清單是空的，請從左側側邊欄新增股票！")
+    st.info("目前沒有股票，請上傳 CSV 或手動新增。")
 else:
     for ticker, name in st.session_state.stock_dict.items():
         price, k = get_k_value(ticker)
         
         if price:
-            # 判斷邏輯
             if k < 20:
-                color = "#2e7d32" # 深綠
-                action = "🟢 進場訊號 (買)"
-                bg_color = "#e8f5e9" # 淡綠底
+                color, action, bg = "#2e7d32", "🟢 買進", "#e8f5e9"
             elif k > 80:
-                color = "#c62828" # 深紅
-                action = "🔴 過熱訊號 (賣)"
-                bg_color = "#ffebee" # 淡紅底
+                color, action, bg = "#c62828", "🔴 賣出", "#ffebee"
             else:
-                color = "#ef6c00" # 橘色
-                action = "🟡 觀望持有"
-                bg_color = "#fff3e0" # 淡橘底
-                
-            # HTML 卡片設計
+                color, action, bg = "#ef6c00", "🟡 觀望", "#fff3e0"
+            
             st.markdown(
                 f"""
-                <div style="padding:15px; border-radius:12px; margin-bottom:12px; background-color:{bg_color}; border:1px solid rgba(0,0,0,0.1); box-shadow: 2px 2px 5px rgba(0,0,0,0.05);">
-                    <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                <div style="padding:15px; border-radius:10px; margin-bottom:10px; background-color:{bg}; border:1px solid #ddd;">
+                    <div style="display:flex; justify-content:space-between;">
                         <div>
-                            <h3 style="margin:0; color:#333; font-size:1.3em;">{name}</h3>
-                            <span style="font-size:0.85em; color:#666; font-family:monospace;">{ticker}</span>
+                            <strong style="font-size:1.2em; color:#333;">{name}</strong>
+                            <div style="font-size:0.8em; color:#666;">{ticker}</div>
                         </div>
                         <div style="text-align:right;">
-                            <strong style="color:{color}; font-size:1.1em;">{action}</strong>
+                            <div style="color:{color}; font-weight:bold;">{action}</div>
                         </div>
                     </div>
-                    <hr style="margin:10px 0; border:0; border-top:1px dashed #ccc;">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <div>
-                            <span style="font-size:0.8em; color:#777;">現價</span><br>
-                            <strong style="font-size:1.4em; color:#333;">{price:.2f}</strong>
-                        </div>
-                        <div style="text-align:right;">
-                            <span style="font-size:0.8em; color:#777;">K值 (9,3,3)</span><br>
-                            <strong style="font-size:1.4em; color:{color};">{k:.2f}</strong>
-                        </div>
+                    <hr style="margin:8px 0; border-top:1px dashed #ccc;">
+                    <div style="display:flex; justify-content:space-between;">
+                        <span>現價: <b>{price:.2f}</b></span>
+                        <span style="color:{color}">K值: <b>{k:.2f}</b></span>
                     </div>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
         else:
-            st.error(f"❌ {name} ({ticker}): 讀取失敗，請檢查代號是否正確")
-
-st.markdown("---")
-st.caption("資料儲存於伺服器: my_stocks.json")
+            st.error(f"❌ {name}: 讀取失敗")
